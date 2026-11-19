@@ -1,90 +1,84 @@
 using System;
-using System.Diagnostics;
+using System.Collections.Concurrent;
+using System.Globalization;
 using System.IO;
-using System.Reflection;
+using System.Text;
+using System.Threading;
 
 namespace ParsecDisplay
 {
-    /// <summary>
-    /// Lightweight diagnostic logger. Appends to &lt;exe-dir&gt;\debug.log on each
-    /// launch (with a separator/header), and mirrors output to the attached
-    /// console (CLI / debugger). Thread-safe via a single file lock; both
-    /// destinations no-op silently on failure.
-    /// </summary>
+    // Bounded asynchronous logging keeps disk I/O off the keep-alive thread.
     internal static class Log
     {
-        static readonly object FileLock = new object();
+        static readonly ConcurrentQueue<string> Queue = new ConcurrentQueue<string>();
+        static readonly AutoResetEvent Wake = new AutoResetEvent(false);
+        static readonly Thread Worker;
         static readonly string LogPath;
+        static int Queued;
+        static volatile bool Stopping;
+        internal const int MaximumBytes = 512 * 1024;
 
         static Log()
         {
-            try
-            {
-                var exe = Assembly.GetExecutingAssembly().Location;
-                var dir = Path.GetDirectoryName(exe) ?? Environment.CurrentDirectory;
-                LogPath = Path.Combine(dir, "debug.log");
-
-                var sep = new string('=', 70);
-                var header =
-                    sep + Environment.NewLine +
-                    $"{Program.AppName} v{Program.AppVersion} | pid={Process.GetCurrentProcess().Id} | {DateTime.Now:yyyy-MM-dd HH:mm:ss}" + Environment.NewLine +
-                    sep + Environment.NewLine;
-                File.AppendAllText(LogPath, header);
-            }
-            catch
-            {
-                LogPath = null;
-            }
+            var directory = Environment.GetEnvironmentVariable("PARSEC_DISPLAY_LOG_DIR");
+            if (string.IsNullOrWhiteSpace(directory)) directory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs");
+            LogPath = Path.Combine(directory, "debug.log");
+            Worker = new Thread(Drain) { IsBackground = true, Priority = ThreadPriority.BelowNormal, Name = "Parsec bounded log" };
+            Worker.Start();
         }
+        public static void Info(string f, params object[] a) { Write("INF", f, a); }
+        public static void Debug(string f, params object[] a) { Write("DBG", f, a); }
+        public static void Warn(string f, params object[] a) { Write("WRN", f, a); }
+        public static void Error(string f, params object[] a) { Write("ERR", f, a); }
 
-        public static void Info (string msg) => Write("INF", msg, false);
-        public static void Debug(string msg) => Write("DBG", msg, false);
-        public static void Warn (string msg) => Write("WRN", msg, true);
-        public static void Error(string msg) => Write("ERR", msg, true);
-
-        public static void Info (string fmt, params object[] args) => Write("INF", Fmt(fmt, args), false);
-        public static void Debug(string fmt, params object[] args) => Write("DBG", Fmt(fmt, args), false);
-        public static void Warn (string fmt, params object[] args) => Write("WRN", Fmt(fmt, args), true);
-        public static void Error(string fmt, params object[] args) => Write("ERR", Fmt(fmt, args), true);
-
-        static string Fmt(string fmt, object[] args)
+        static void Write(string level, string format, object[] args)
         {
-            if (args == null || args.Length == 0) return fmt;
-            try { return string.Format(fmt, args); }
-            catch { return fmt; }
+            if (Stopping) return;
+            if (Interlocked.Increment(ref Queued) > 64) { Interlocked.Decrement(ref Queued); return; }
+            string message;
+            try { message = args.Length == 0 ? format : string.Format(CultureInfo.InvariantCulture, format, args); }
+            catch { message = format; }
+            if (message.Length > 2000) message = message.Substring(0, 2000);
+            Queue.Enqueue("[" + DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss.fff", CultureInfo.InvariantCulture) + "] " + level + " " + message.Replace('\r', ' ').Replace('\n', ' '));
+            Wake.Set();
         }
-
-        static void Write(string level, string message, bool toStderr)
+        static void Drain()
         {
-            var line = $"[{DateTime.Now:HH:mm:ss.fff}] {level} {message}";
-
-            // Console — silent no-op for GUI processes with no attached console.
-            try
+            var lastPrune = DateTime.MinValue;
+            while (!Stopping || !Queue.IsEmpty)
             {
-                ConsoleColor? color = null;
-                switch (level)
+                Wake.WaitOne(1000);
+                try
                 {
-                    case "DBG": color = ConsoleColor.DarkGray; break;
-                    case "WRN": color = ConsoleColor.Yellow;   break;
-                    case "ERR": color = ConsoleColor.Red;      break;
+                    Directory.CreateDirectory(Path.GetDirectoryName(LogPath));
+                    string line;
+                    while (Queue.TryDequeue(out line))
+                    {
+                        Interlocked.Decrement(ref Queued);
+                        try { Console.WriteLine(line); } catch { }
+                        File.AppendAllText(LogPath, line + Environment.NewLine, new UTF8Encoding(false));
+                        if (new FileInfo(LogPath).Length > MaximumBytes) Prune(LogPath, DateTime.Now.AddHours(-1));
+                    }
+                    if (File.Exists(LogPath) && (DateTime.Now - lastPrune).TotalMinutes >= 1)
+                    {
+                        Prune(LogPath, DateTime.Now.AddHours(-1)); lastPrune = DateTime.Now;
+                    }
                 }
-                var prev = color.HasValue ? Console.ForegroundColor : ConsoleColor.Gray;
-                if (color.HasValue) Console.ForegroundColor = color.Value;
-                if (toStderr) Console.Error.WriteLine(line);
-                else          Console.Out.WriteLine(line);
-                if (color.HasValue) Console.ForegroundColor = prev;
-            }
-            catch { /* no console attached */ }
-
-            // File
-            if (LogPath != null)
-            {
-                lock (FileLock)
-                {
-                    try { File.AppendAllText(LogPath, line + Environment.NewLine); }
-                    catch { /* disk full, perms, etc — drop silently */ }
-                }
+                catch { /* A logging failure must not stop driver maintenance. */ }
             }
         }
+        internal static void Prune(string path, DateTime cutoff)
+        {
+            var retained = new System.Collections.Generic.Queue<string>(); int bytes = 0;
+            foreach (var line in File.ReadLines(path))
+            {
+                DateTime time;
+                if (line.Length < 25 || !DateTime.TryParseExact(line.Substring(1, 23), "yyyy-MM-ddTHH:mm:ss.fff", CultureInfo.InvariantCulture, DateTimeStyles.None, out time) || time < cutoff) continue;
+                retained.Enqueue(line); bytes += Encoding.UTF8.GetByteCount(line) + 2;
+                while (bytes > MaximumBytes && retained.Count > 0) bytes -= Encoding.UTF8.GetByteCount(retained.Dequeue()) + 2;
+            }
+            File.WriteAllLines(path, retained.ToArray(), new UTF8Encoding(false));
+        }
+        public static void Shutdown() { Stopping = true; Wake.Set(); Worker.Join(2000); }
     }
 }

@@ -130,9 +130,11 @@ namespace ParsecDisplay.Vdd
         /// <summary>
         /// Update driver session to keep added displays alive.
         /// </summary>
-        public static void Update(IntPtr vdd)
+        [ThreadStatic] internal static int LastIoError;
+
+        public static bool Update(IntPtr vdd)
         {
-            IoControl(vdd, IoCtlCode.IOCTL_UPDATE, null, 1000);
+            return IoControl(vdd, IoCtlCode.IOCTL_UPDATE, null, 1000);
         }
 
         private enum IoCtlCode
@@ -154,7 +156,7 @@ namespace ParsecDisplay.Vdd
         private static bool IoControl(IntPtr handle, IoCtlCode code, byte[] input, int* result, int timeout)
         {
             if (handle == IntPtr.Zero || handle == (IntPtr)(-1))
-                return false;
+            { LastIoError = 6; return false; }
 
             var InBuffer = new byte[32];
             var Overlapped = new Native.OVERLAPPED();
@@ -167,7 +169,7 @@ namespace ParsecDisplay.Vdd
                 int outputLength = result != null ? sizeof(int) : 0;
                 Overlapped.hEvent = Native.CreateEvent(null, false, false, null);
                 if (Overlapped.hEvent == IntPtr.Zero)
-                    return false;
+                { LastIoError = Marshal.GetLastWin32Error(); return false; }
 
                 try
                 {
@@ -183,6 +185,8 @@ namespace ParsecDisplay.Vdd
 
                     bool success = Native.GetOverlappedResultEx(handle, ref Overlapped,
                         out var _, timeout, false);
+                    // Preserve the original failure before logging/cancellation changes it.
+                    LastIoError = success ? 0 : Marshal.GetLastWin32Error();
 
                     if (code != IoCtlCode.IOCTL_UPDATE)
                         Log.Debug("IoControl {0} -> {1}, err={2}",

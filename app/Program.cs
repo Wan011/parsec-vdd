@@ -10,7 +10,7 @@ namespace ParsecDisplay
     {
         public const string AppId = "QpHOX8IBUHBznGtqk9xm1";
         public const string AppName = nameof(ParsecDisplay);
-        public const string AppVersion = "1.0.2";
+        public const string AppVersion = "1.0.2.1";
         public const string GitHubRepo = "nomi-san/parsec-vdd";
 
         [STAThread]
@@ -51,6 +51,7 @@ namespace ParsecDisplay
 
                 Application.Run(new Tray());
                 Log.Info("Main exit");
+                Log.Shutdown();
             }
             else
             {

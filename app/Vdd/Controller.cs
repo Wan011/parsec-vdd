@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Collections.Generic;
 using System.Threading;
 
@@ -6,6 +7,8 @@ namespace ParsecDisplay.Vdd
 {
     internal static class Controller
     {
+        static readonly ReaderWriterLockSlim HandleLifetime = new ReaderWriterLockSlim();
+        static int ReopenRequested;
         static Thread UpdateThread;
         static Thread StatusThread;
         static CancellationTokenSource Cancellation;
@@ -96,6 +99,8 @@ namespace ParsecDisplay.Vdd
 
             Suspended = true;
 
+            HandleLifetime.EnterWriteLock();
+            try {
             // Unplug in reverse order to keep Windows 10 from inventing a
             // new Connectivity registry entry for the remaining subset.
             if (VddHandle.IsValidHandle())
@@ -110,6 +115,8 @@ namespace ParsecDisplay.Vdd
             var handle = Interlocked.Exchange(ref VddHandle, IntPtr.Zero);
             HandleReady.Reset();
             Device.CloseHandle(handle);
+
+            } finally { HandleLifetime.ExitWriteLock(); }
 
             return snapshot;
         }
@@ -128,16 +135,47 @@ namespace ParsecDisplay.Vdd
 
         static void UpdateLoop(CancellationToken cancellation)
         {
+            var clock = Stopwatch.StartNew();
+            var health = new HeartbeatHealth();
+            double previousStart = 0, summaryAt = 0;
             while (!cancellation.IsCancellationRequested)
             {
-                if (!Suspended
-                    && VddHandle.IsValidHandle()
-                    && LastStatus == Device.Status.OK)
+                var started = clock.Elapsed.TotalMilliseconds;
+                var gap = previousStart == 0 ? 0 : started - previousStart;
+                previousStart = started;
+                bool attempted = false, success = false; int error = 0;
+                try
                 {
-                    Core.Update(VddHandle);
+                    HandleLifetime.EnterReadLock();
+                    try
+                    {
+                        if (!Suspended && VddHandle.IsValidHandle() && LastStatus == Device.Status.OK)
+                        { attempted = true; success = Core.Update(VddHandle); error = Core.LastIoError; }
+                    }
+                    finally { HandleLifetime.ExitReadLock(); }
+                    if (attempted)
+                    {
+                        var now = clock.Elapsed.TotalMilliseconds; var ioMs = now - started;
+                        var reopen = health.Record(success, now, ioMs);
+                        if (health.ShouldWarn(now, success, ioMs, gap))
+                            Log.Warn("Heartbeat ok={0} error={1} ioMs={2:F1} startGapMs={3:F1} failures={4}", success, error, ioMs, gap, health.ConsecutiveFailures);
+                        if (reopen)
+                        { Interlocked.Exchange(ref ReopenRequested, 1); StatusKick.Set(); Log.Warn("Heartbeat requested handle reopen after repeated failures"); }
+                        if (now - summaryAt >= 60000)
+                        {
+                            Log.Info("Heartbeat summary failures={0} maxSuccessGapMs={1:F1} maxIoMs={2:F1}", health.Failures, health.MaximumGapMs, health.MaximumIoMs);
+                            summaryAt = now;
+                        }
+                    }
                 }
-
-                Thread.Sleep(100);
+                catch (Exception ex)
+                {
+                    var now = clock.Elapsed.TotalMilliseconds;
+                    var reopen = health.Record(false, now, now - started);
+                    if (health.ShouldWarn(now, false, now - started, gap)) Log.Error("Heartbeat loop exception: {0}", ex);
+                    if (reopen) { Interlocked.Exchange(ref ReopenRequested, 1); StatusKick.Set(); }
+                }
+                if (cancellation.WaitHandle.WaitOne(100)) break;
             }
         }
 
@@ -160,6 +198,13 @@ namespace ParsecDisplay.Vdd
                 if (status != prev)
                     Log.Info("Driver status: {0} -> {1}", prev, status);
 
+                HandleLifetime.EnterWriteLock();
+                try {
+                if (Interlocked.Exchange(ref ReopenRequested, 0) != 0) {
+                    var stale = Interlocked.Exchange(ref VddHandle, IntPtr.Zero);
+                    HandleReady.Reset(); Device.CloseHandle(stale);
+                    Log.Warn("Reopening driver handle following heartbeat failure");
+                }
                 if (status == Device.Status.OK)
                 {
                     if (!VddHandle.IsValidHandle())
@@ -187,6 +232,8 @@ namespace ParsecDisplay.Vdd
                         Log.Info("Handle closed (status={0})", status);
                     }
                 }
+
+                } finally { HandleLifetime.ExitWriteLock(); }
 
                 // Wait up to 2s — KickStatusCheck() / Resume() shortcut this.
                 try { StatusKick.Wait(2000, cancellation); }
@@ -230,20 +277,13 @@ namespace ParsecDisplay.Vdd
                 throw new ErrorExceededLimit(limit);
             }
 
-            // Snapshot the handle ONCE so StatusLoop closing it after this
-            // check doesn't leave us calling DeviceIoControl on a stale value.
-            var handle = VddHandle;
-            if (!handle.IsValidHandle())
-            {
-                Log.Warn("AddDisplay refused: handle not open");
-                throw new ErrorDeviceHandle();
-            }
-
-            if (!Core.AddDisplay(handle, out driverIndex))
-            {
-                Log.Error("AddDisplay: IOCTL failed");
-                throw new ErrorOperationFailed(ErrorOperationFailed.Operation.AddDisplay);
-            }
+            HandleLifetime.EnterReadLock();
+            try {
+                var handle = VddHandle;
+                if (!handle.IsValidHandle()) throw new ErrorDeviceHandle();
+                if (!Core.AddDisplay(handle, out driverIndex))
+                    throw new ErrorOperationFailed(ErrorOperationFailed.Operation.AddDisplay);
+            } finally { HandleLifetime.ExitReadLock(); }
 
             Log.Info("AddDisplay: index={0}", driverIndex);
         }
@@ -260,17 +300,13 @@ namespace ParsecDisplay.Vdd
             if (index < 0)
                 return;
 
-            if (!VddHandle.IsValidHandle())
-            {
-                Log.Warn("RemoveDisplay({0}) refused: handle not open", index);
-                throw new ErrorDeviceHandle();
-            }
-
-            if (!Core.RemoveDisplay(VddHandle, index))
-            {
-                Log.Error("RemoveDisplay({0}): IOCTL failed", index);
-                throw new ErrorOperationFailed(ErrorOperationFailed.Operation.RemoveDisplay);
-            }
+            HandleLifetime.EnterReadLock();
+            try {
+                var handle = VddHandle;
+                if (!handle.IsValidHandle()) throw new ErrorDeviceHandle();
+                if (!Core.RemoveDisplay(handle, index))
+                    throw new ErrorOperationFailed(ErrorOperationFailed.Operation.RemoveDisplay);
+            } finally { HandleLifetime.ExitReadLock(); }
 
             Log.Info("RemoveDisplay: index={0}", index);
         }

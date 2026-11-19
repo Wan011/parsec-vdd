@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Diagnostics;
 using System.Collections.Generic;
 using System.Windows.Forms;
 using System.Drawing;
@@ -36,6 +37,13 @@ namespace ParsecDisplay
         // has fully unwound (the MainWindow.DisplayChanged fallback path can
         // re-trigger us while we're still showing the error MessageBox).
         int InAddDisplay;
+        int Restoring;
+        int RecoveryBusy;
+        int ManualRemoval;
+        readonly Vdd.MissingDisplayPolicy MissingPolicy = new Vdd.MissingDisplayPolicy();
+        long ManualRemovalUntilMs;
+        readonly Stopwatch RecoveryClock = Stopwatch.StartNew();
+        System.Threading.Timer RecoveryTimer;
 
         // Driver index of the fallback display we auto-added because the host
         // had no physical display. -1 = not active. Reset on suspend.
@@ -133,6 +141,7 @@ namespace ParsecDisplay
             FallbackTimer = new System.Threading.Timer(EvaluateFallback,
                 null, Timeout.Infinite, Timeout.Infinite);
 
+            RecoveryTimer = new System.Threading.Timer(CheckMissingDisplays, null, 15000, 5000);
             SystemEvents.SessionEnding += SaveDisplayState;
             SystemEvents.SessionSwitch += SaveDisplayState;
             SystemEvents.DisplaySettingsChanged += SaveDisplayState;
@@ -261,7 +270,31 @@ namespace ParsecDisplay
         /// Add N virtual displays and apply the saved per-display modes
         /// atomically (CDS_NORESET on each, single Commit at the end).
         /// </summary>
+        void CheckMissingDisplays(object unused)
+        {
+            if (Interlocked.Exchange(ref RecoveryBusy, 1) != 0) return;
+            try
+            {
+                if (Vdd.Controller.IsSuspended || !Config.RestoreDisplays || Volatile.Read(ref ManualRemoval) != 0 || Volatile.Read(ref Restoring) != 0 || RecoveryClock.ElapsedMilliseconds < Interlocked.Read(ref ManualRemovalUntilMs)) { MissingPolicy.Observe(0,0,true,RecoveryClock.ElapsedMilliseconds); return; }
+                var existing = Vdd.Core.GetDisplays().Count;
+                var states = Display.UnpackStates(Config.SavedDisplays);
+                if (!MissingPolicy.Observe(existing, states.Count, false, RecoveryClock.ElapsedMilliseconds)) return;
+                if (!Vdd.Controller.WaitForReady(100) || Vdd.Controller.QueryStatus() != Device.Status.OK) return;
+                Log.Warn("Unexpected loss of all virtual displays; attempting restore of {0} saved display(s)", states.Count);
+                RestoreFromStates(states);
+            }
+            catch (Exception ex) { Log.Error("Missing-display recovery failed: {0}", ex); }
+            finally { Volatile.Write(ref RecoveryBusy, 0); }
+        }
+
         void RestoreFromStates(List<Display.State> states)
+        {
+            if (Interlocked.Exchange(ref Restoring, 1) != 0) return;
+            try { RestoreFromStatesCore(states); }
+            finally { Volatile.Write(ref Restoring, 0); }
+        }
+
+        void RestoreFromStatesCore(List<Display.State> states)
         {
             int wanted = Math.Min(states.Count, Vdd.Core.MAX_DISPLAYS);
 
@@ -453,7 +486,12 @@ namespace ParsecDisplay
         {
             try
             {
-                Vdd.Controller.RemoveDisplay(index);
+                Interlocked.Exchange(ref ManualRemovalUntilMs, RecoveryClock.ElapsedMilliseconds + 30000);
+                Interlocked.Exchange(ref ManualRemoval, 1);
+                try { Vdd.Controller.RemoveDisplay(index); }
+                finally { Volatile.Write(ref ManualRemoval, 0); }
+                if (Vdd.Core.GetDisplays().Count == 0) Config.SavedDisplays = string.Empty;
+                else SaveDisplayState(null, EventArgs.Empty);
             }
             catch (Vdd.ErrorOperationFailed)
             {
@@ -466,7 +504,12 @@ namespace ParsecDisplay
         {
             try
             {
-                Vdd.Controller.RemoveLastDisplay();
+                Interlocked.Exchange(ref ManualRemovalUntilMs, RecoveryClock.ElapsedMilliseconds + 30000);
+                Interlocked.Exchange(ref ManualRemoval, 1);
+                try { Vdd.Controller.RemoveLastDisplay(); }
+                finally { Volatile.Write(ref ManualRemoval, 0); }
+                if (Vdd.Core.GetDisplays().Count == 0) Config.SavedDisplays = string.Empty;
+                else SaveDisplayState(null, EventArgs.Empty);
             }
             catch (Vdd.ErrorOperationFailed)
             {
@@ -567,7 +610,7 @@ namespace ParsecDisplay
             if (Vdd.Controller.IsSuspended)
                 return;
 
-            if (!Config.RestoreDisplays)
+            if (!Config.RestoreDisplays || Volatile.Read(ref Restoring) != 0 || Volatile.Read(ref ManualRemoval) != 0)
                 return;
 
             var displays = Vdd.Core.GetDisplays();
@@ -577,7 +620,8 @@ namespace ParsecDisplay
                 if (d.Active && d.CurrentMode != null)
                     states.Add(d.Snapshot());
             }
-            Config.SavedDisplays = Display.PackStates(states);
+            // A watchdog disconnect must not erase the only saved recovery mode.
+            if (states.Count > 0 || RecoveryClock.ElapsedMilliseconds < Interlocked.Read(ref ManualRemovalUntilMs)) Config.SavedDisplays = Display.PackStates(states);
         }
 
         public void ShowApp()
@@ -637,6 +681,7 @@ namespace ParsecDisplay
                 }
             }
 
+            RecoveryTimer?.Dispose();
             SystemEvents.SessionEnding -= SaveDisplayState;
             SystemEvents.SessionSwitch -= SaveDisplayState;
             SystemEvents.DisplaySettingsChanged -= SaveDisplayState;

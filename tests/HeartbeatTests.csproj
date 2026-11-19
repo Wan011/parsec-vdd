@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+ <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net472</TargetFramework><LangVersion>latest</LangVersion><EnableDefaultCompileItems>false</EnableDefaultCompileItems><AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath></PropertyGroup>
+ <ItemGroup>
+  <Compile Include="HeartbeatTests.cs" />
+  <Compile Include="../app/Vdd/Controller.cs" Link="Controller.cs" />
+  <Compile Include="../app/Vdd/HeartbeatHealth.cs" Link="HeartbeatHealth.cs" />
+  <Compile Include="../app/Vdd/MissingDisplayPolicy.cs" Link="MissingDisplayPolicy.cs" />
+  <Compile Include="../app/Vdd/Errors.cs" Link="Errors.cs" />
+  <Compile Include="../app/Log.cs" Link="Log.cs" />
+ </ItemGroup>
+</Project>
